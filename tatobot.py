@@ -14,7 +14,7 @@ try:
     # Inicializamos el cliente oficial
     client = genai.Client(api_key=API_KEY)
     # DEFINIMOS EL MODELO QUE VIMOS EN TU LISTA
-    MODEL_ID = "gemini-2.0-flash-lite" 
+    MODEL_ID = "gemini-2.5-flash-lite" 
 except Exception as e:
     st.error("⚠️ Error: Configure su API KEY en los Secrets de Streamlit.")
     st.stop()
@@ -80,7 +80,7 @@ def procesar_archivo(file, prompt_usuario):
 
 # --- 4. INTERFAZ DE USUARIO ---
 st.set_page_config(page_title="TatoBot Pro", layout="wide")
-st.title("📊 Extractor Contable TatoBot (v2.0 Flash)")
+st.title("📊 Extractor Contable TatoBot (v2.5 Flash)")
 
 with st.sidebar:
     st.header("⚙️ Configuración")
