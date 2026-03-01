@@ -1,6 +1,6 @@
 import streamlit as st
 from google import genai
-from google.generativeai import types
+from google.genai import types
 import pandas as pd
 from pdf2image import convert_from_bytes
 from PIL import Image
