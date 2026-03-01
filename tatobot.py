@@ -4,40 +4,39 @@ from google.genai import types
 import pandas as pd
 from pdf2image import convert_from_bytes
 from PIL import Image
-# Importamos io para manejar los datos del Excel en memoria
 import io
 import json
 import re
 
-# --- 1. CONFIGURACIÓN DE SEGURIDAD ---
-# Intentamos obtener la clave desde los Secrets de Streamlit
+# --- 1. CONFIGURACIÓN DEL CLIENTE ---
 try:
     API_KEY = st.secrets["GOOGLE_API_KEY"]
-    # Inicializamos el nuevo cliente de Google GenAI
+    # Inicializamos el cliente oficial de Google GenAI
     client = genai.Client(api_key=API_KEY)
 except Exception as e:
-    st.error("⚠️ Error crítico: No se encontró la 'GOOGLE_API_KEY' en los Secrets.")
+    st.error("⚠️ Error: No se encontró la API KEY en los Secrets de Streamlit.")
     st.stop()
 
 # --- 2. LÓGICA DE NEGOCIO (FACTURAS A/B) ---
 def aplicar_logica_iva(datos):
     """
-    Si es Factura B, calculamos el neto y el IVA a partir del Total.
-    Basado en los ejemplos de gastos analizados (ej: combustibles).
+    Calcula el desglose de IVA para Facturas B si la IA no lo hizo.
     """
     try:
-        # Normalizamos el tipo de factura a mayúsculas
         tipo = str(datos.get("TIPO_FACTURA", "")).upper()
+        # Limpieza de números
+        def clean_num(val):
+            if not val: return 0.0
+            s = str(val).replace('$', '').replace('.', '').replace(',', '.')
+            res = re.findall(r"[-+]?\d*\.\d+|\d+", s)
+            return float(res[0]) if res else 0.0
+
+        total = clean_num(datos.get("MONTO_TOTAL"))
         
-        # Intentamos obtener el total asegurándonos que sea un número
-        total_str = str(datos.get("MONTO_TOTAL", "0")).replace(',', '.')
-        total = float(re.findall(r"[-+]?\d*\.\d+|\d+", total_str)[0]) if total_str else 0
-        
-        # Si es Factura B, desglosamos el IVA 21% si no viene especificado
         if "B" in tipo:
-            monto_gravado = datos.get("MONTO_GRAVADO")
-            # Si el gravado está vacío o es igual al total, hacemos la cuenta
-            if not monto_gravado or float(str(monto_gravado).replace(',','.')) == total:
+            gravado = clean_num(datos.get("MONTO_GRAVADO"))
+            # Si el gravado no está o es igual al total, calculamos neto
+            if gravado == 0 or gravado == total:
                 neto = round(total / 1.21, 2)
                 iva = round(total - neto, 2)
                 datos["MONTO_GRAVADO"] = neto
@@ -46,131 +45,122 @@ def aplicar_logica_iva(datos):
     except:
         return datos
 
-# --- 3. FUNCIÓN DE PROCESAMIENTO ---
+# --- 3. FUNCIÓN DE EXTRACCIÓN ---
 def procesar_archivo(file, prompt_usuario):
     try:
-        # Convertir PDF a imagen si es necesario
+        # Convertir PDF a imagen (primera página)
         if file.type == "application/pdf":
             paginas = convert_from_bytes(file.read())
-            imagen_final = paginas[0] # Tomamos la primera hoja
+            imagen_final = paginas[0]
         else:
             imagen_final = Image.open(file)
 
-        # Configuramos el Prompt con instrucciones estrictas
         prompt_sistema = f"""
-        Actúa como un experto contable argentino. Analiza la imagen y extrae:
+        Eres un experto contable argentino. Extrae estos campos en un JSON PURO:
         TIPO_FACTURA, PUNTO_VENTA, NRO_FACTURA, CUIT_EMISOR, FECHA_EMISION, 
         RAZON_SOCIAL, MONTO_GRAVADO, IVA_27, IVA_21, IVA_10_5, PERCEPCION_IVA, 
         RETENCION_IVA, MONTO_NO_GRAVADO, MONTO_TOTAL.
         
-        Instrucción adicional del usuario: {prompt_usuario}
+        Instrucción adicional: {prompt_usuario}
         
-        IMPORTANTE: Devuelve únicamente un objeto JSON válido. 
-        No incluyas texto explicativo, ni marcas de código como ```json.
+        IMPORTANTE: No escribas nada más que el objeto JSON. Sin ```json.
         """
 
-        # Llamada a la nueva API de Google
+        # Intentamos con el ID de modelo estándar
+        # Si esto falla, el error será capturado por el bloque except
         response = client.models.generate_content(
             model="gemini-1.5-flash",
             contents=[prompt_sistema, imagen_final]
         )
         
-        # Limpieza de la respuesta para asegurar que sea JSON puro
-        texto_respuesta = response.text
-        # Eliminamos posibles etiquetas de markdown que la IA a veces agrega
-        texto_respuesta = texto_respuesta.replace("```json", "").replace("```", "").strip()
+        # Limpiar respuesta y cargar JSON
+        texto = response.text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(texto)
         
-        data_json = json.loads(texto_respuesta)
-        # Aplicamos la lógica de cálculo A/B
-        data_json = aplicar_logica_iva(data_json)
-        data_json["ARCHIVO_ORIGEN"] = file.name
-        
-        return data_json, None
+        # Aplicar cálculos y tracking
+        data = aplicar_logica_iva(data)
+        data["ARCHIVO_ORIGEN"] = file.name
+        return data, None
 
     except Exception as e:
-        # Devolvemos el diccionario con el nombre y el error detallado
         return {"ARCHIVO_ORIGEN": file.name}, str(e)
 
-# --- 4. INTERFAZ DE USUARIO (STREAMLIT) ---
-st.set_page_config(page_title="TatoBot AI", layout="wide")
-st.title("📊 Extractor Inteligente de Facturas")
-st.markdown("---")
+# --- 4. INTERFAZ DE USUARIO ---
+st.set_page_config(page_title="TatoBot Pro", layout="wide")
+st.title("🚀 Extractor Contable de Alta Performance")
 
-# Barra lateral para configuraciones extra
 with st.sidebar:
-    st.header("⚙️ Opciones")
-    extra = st.text_input("¿Dato adicional a buscar?", placeholder="Ej: Vencimiento, Patente")
-    st.info("Desarrollado para procesamiento masivo de Compras y Ventas.")
+    st.header("⚙️ Configuración")
+    extra_field = st.text_input("Campo extra a buscar:", placeholder="Ej: Ingresos Brutos")
+    
+    # Botón de Diagnóstico para el error 404 (Lo que pediste de ListModels)
+    if st.button("🔍 Diagnóstico de Modelos"):
+        try:
+            st.write("Modelos disponibles para tu API Key:")
+            for m in client.models.list():
+                st.code(m.name)
+        except Exception as err:
+            st.error(f"No se pudo listar modelos: {err}")
 
-# Pestañas de la aplicación
 tab_compras, tab_ventas = st.tabs(["🛒 Compras / Gastos", "💰 Ventas / Ingresos"])
 
-# --- LÓGICA DE COMPRAS ---
+# --- SECCIÓN COMPRAS ---
 with tab_compras:
-    st.subheader("Subir Facturas de Compras")
-    u_compras = st.file_uploader("Arrastra aquí tus archivos", type=["pdf", "jpg", "png"], accept_multiple_files=True, key="comp")
+    st.subheader("Carga masiva de Compras")
+    u_compras = st.file_uploader("PDFs o Fotos de Compras", type=["pdf","jpg","png"], accept_multiple_files=True, key="c")
     
     if st.button("Procesar Compras") and u_compras:
-        resultados_ok = []
-        errores_log = []
-        progreso = st.progress(0)
+        res_ok, errores = [], []
+        bar = st.progress(0)
         
         for idx, f in enumerate(u_compras):
-            res, err = procesar_archivo(f, f"Foco en Proveedor. {extra}")
+            res, err = procesar_archivo(f, f"Foco en PROVEEDOR. {extra_field}")
             if err:
-                st.error(f"❌ Error en {f.name}: Ocurrió un error inesperado, contáctese con Tatito.")
-                errores_log.append({"archivo": f.name, "error": err})
+                st.error(f"Error en {f.name}: Contacte a su Tatito.")
+                errores.append({"archivo": f.name, "error": err})
             else:
-                resultados_ok.append(res)
-            progreso.progress((idx + 1) / len(u_compras))
-        
-        if resultados_ok:
-            df = pd.DataFrame(resultados_ok)
-            st.write("### Vista previa de datos extraídos")
-            st.dataframe(df)
+                res_ok.append(res)
+            bar.progress((idx + 1) / len(u_compras))
             
-            # Generación de Excel para descarga
+        if res_ok:
+            df = pd.DataFrame(res_ok)
+            st.dataframe(df)
             buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
-                df.to_excel(writer, index=False, sheet_name='Compras')
-            st.download_button("📥 Descargar Excel de Compras", buf.getvalue(), "compras_extraidas.xlsx")
+            with pd.ExcelWriter(buf, engine='xlsxwriter') as w:
+                df.to_excel(w, index=False)
+            st.download_button("📥 Descargar Excel Compras", buf.getvalue(), "compras.xlsx")
+            
+        if errores:
+            with st.expander("🛠️ Detalle Técnico (Tatito)"):
+                st.write(errores)
 
-        # Registro técnico para el dueño del proyecto (Tú)
-        if errores_log:
-            with st.expander("🛠️ Ver Detalle Técnico de Errores"):
-                for e in errores_log:
-                    st.code(f"Archivo: {e['archivo']}\nError: {e['error']}")
-
-# --- LÓGICA DE VENTAS ---
+# --- SECCIÓN VENTAS ---
 with tab_ventas:
-    st.subheader("Subir Facturas de Ventas")
-    u_ventas = st.file_uploader("Arrastra aquí tus archivos", type=["pdf", "jpg", "png"], accept_multiple_files=True, key="vent")
+    st.subheader("Carga masiva de Ventas")
+    u_ventas = st.file_uploader("PDFs o Fotos de Ventas", type=["pdf","jpg","png"], accept_multiple_files=True, key="v")
     
     if st.button("Procesar Ventas") and u_ventas:
-        resultados_ok = []
-        errores_log = []
-        progreso = st.progress(0)
+        res_ok_v, errores_v = [], []
+        bar_v = st.progress(0)
         
         for idx, f in enumerate(u_ventas):
-            res, err = procesar_archivo(f, f"Foco en Cliente y receptor. {extra}")
+            # Aquí cambiamos el foco del prompt para Ventas
+            res, err = procesar_archivo(f, f"Foco en CLIENTE / RECEPTOR. {extra_field}")
             if err:
-                st.error(f"❌ Error en {f.name}: Ocurrió un error inesperado, contáctese con Tatito.")
-                errores_log.append({"archivo": f.name, "error": err})
+                st.error(f"Error en {f.name}: Contacte a su Tatito.")
+                errores_v.append({"archivo": f.name, "error": err})
             else:
-                resultados_ok.append(res)
-            progreso.progress((idx + 1) / len(u_ventas))
+                res_ok_v.append(res)
+            bar_v.progress((idx + 1) / len(u_ventas))
             
-        if resultados_ok:
-            df_v = pd.DataFrame(resultados_ok)
-            st.write("### Vista previa de ventas extraídas")
+        if res_ok_v:
+            df_v = pd.DataFrame(res_ok_v)
             st.dataframe(df_v)
-            
             buf_v = io.BytesIO()
-            with pd.ExcelWriter(buf_v, engine='xlsxwriter') as writer:
-                df_v.to_excel(writer, index=False, sheet_name='Ventas')
-            st.download_button("📥 Descargar Excel de Ventas", buf_v.getvalue(), "ventas_extraidas.xlsx")
-
-        if errores_log:
-            with st.expander("🛠️ Ver Detalle Técnico de Errores"):
-                for e in errores_log:
-                    st.code(f"Archivo: {e['archivo']}\nError: {e['error']}")
+            with pd.ExcelWriter(buf_v, engine='xlsxwriter') as w:
+                df_v.to_excel(w, index=False)
+            st.download_button("📥 Descargar Excel Ventas", buf_v.getvalue(), "ventas.xlsx")
+            
+        if errores_v:
+            with st.expander("🛠️ Detalle Técnico (Tatito)"):
+                st.write(errores_v)
