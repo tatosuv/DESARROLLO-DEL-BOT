@@ -1,6 +1,5 @@
 import streamlit as st
 from google import genai
-from google.genai import types
 import pandas as pd
 from pdf2image import convert_from_bytes
 from PIL import Image
@@ -8,138 +7,116 @@ import io
 import json
 import re
 
-# --- 1. CONFIGURACIÓN DEL CLIENTE ---
+# --- CONFIGURACIÓN ---
 try:
     API_KEY = st.secrets["GOOGLE_API_KEY"]
-    # Inicializamos el cliente oficial
     client = genai.Client(api_key=API_KEY)
-    # DEFINIMOS EL MODELO QUE VIMOS EN TU LISTA
+    # Usamos el modelo que te funcionó
     MODEL_ID = "gemini-2.5-flash-lite" 
 except Exception as e:
-    st.error("⚠️ Error: Configure su API KEY en los Secrets de Streamlit.")
+    st.error("⚠️ Configura la API KEY en los Secrets.")
     st.stop()
 
-# --- 2. LÓGICA CONTABLE (FACTURAS A/B) ---
-def aplicar_logica_iva(datos):
+def aplicar_logica_contable(datos):
+    """Asegura que los montos sean numéricos y aplica lógica A/B"""
     try:
-        tipo = str(datos.get("TIPO_FACTURA", "")).upper()
-        
-        def clean_num(val):
-            if not val or val == "null": return 0.0
-            # Limpieza profunda de strings a números
-            s = str(val).replace('$', '').replace('.', '').replace(',', '.')
+        def to_f(v):
+            if v is None or str(v).lower() == "null": return 0.0
+            s = str(v).replace('$', '').replace('.', '').replace(',', '.')
             res = re.findall(r"[-+]?\d*\.\d+|\d+", s)
             return float(res[0]) if res else 0.0
 
-        total = clean_num(datos.get("MONTO_TOTAL"))
+        datos["MONTO_TOTAL"] = to_f(datos.get("MONTO_TOTAL"))
+        datos["MONTO_GRAVADO"] = to_f(datos.get("MONTO_GRAVADO"))
+        datos["IVA_21"] = to_f(datos.get("IVA_21"))
         
-        if "B" in tipo:
-            gravado = clean_num(datos.get("MONTO_GRAVADO"))
-            if gravado == 0 or gravado == total:
-                neto = round(total / 1.21, 2)
-                iva = round(total - neto, 2)
-                datos["MONTO_GRAVADO"] = neto
-                datos["IVA_21"] = iva
+        # Lógica de Factura B: si el gravado es igual al total y hay IVA implícito
+        if "B" in str(datos.get("TIPO_FACTURA", "")).upper():
+            if datos["MONTO_GRAVADO"] == 0 or datos["MONTO_GRAVADO"] == datos["MONTO_TOTAL"]:
+                datos["MONTO_GRAVADO"] = round(datos["MONTO_TOTAL"] / 1.21, 2)
+                datos["IVA_21"] = round(datos["MONTO_TOTAL"] - datos["MONTO_GRAVADO"], 2)
+        
         return datos
     except:
         return datos
 
-# --- 3. FUNCIÓN DE EXTRACCIÓN ---
-def procesar_archivo(file, prompt_usuario):
+def procesar_archivo(file, instruccion_extra):
+    resultados_archivo = []
     try:
+        # 1. Convertir todas las páginas
         if file.type == "application/pdf":
             paginas = convert_from_bytes(file.read())
-            imagen_final = paginas[0]
         else:
-            imagen_final = Image.open(file)
+            paginas = [Image.open(file)]
 
-        prompt_sistema = f"""
-        Eres un experto contable. Extrae estos campos en un JSON PURO:
-        TIPO_FACTURA, PUNTO_VENTA, NRO_FACTURA, CUIT_EMISOR, FECHA_EMISION, 
-        RAZON_SOCIAL, MONTO_GRAVADO, IVA_27, IVA_21, IVA_10_5, PERCEPCION_IVA, 
-        RETENCION_IVA, MONTO_NO_GRAVADO, MONTO_TOTAL.
-        
-        Instrucción adicional: {prompt_usuario}
-        
-        IMPORTANTE: No escribas nada más que el objeto JSON. Sin ```json.
-        """
-
-        # Usamos el modelo gemini-2.0-flash que está en tu lista
-        response = client.models.generate_content(
-            model=MODEL_ID,
-            contents=[prompt_sistema, imagen_final]
-        )
-        
-        texto = response.text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(texto)
-        data = aplicar_logica_iva(data)
-        data["ARCHIVO_ORIGEN"] = file.name
-        return data, None
-    except Exception as e:
-        return {"ARCHIVO_ORIGEN": file.name}, str(e)
-
-# --- 4. INTERFAZ DE USUARIO ---
-st.set_page_config(page_title="TatoBot Pro", layout="wide")
-st.title("📊 Extractor Contable TatoBot (v2.5 Flash)")
-
-with st.sidebar:
-    st.header("⚙️ Configuración")
-    extra_field = st.text_input("Dato extra a buscar:", placeholder="Ej: Patente o IIBB")
-    st.divider()
-    st.write(f"**Modelo activo:** {MODEL_ID}")
-
-tab_compras, tab_ventas = st.tabs(["🛒 Compras / Gastos", "💰 Ventas / Ingresos"])
-
-# --- LÓGICA DE COMPRAS ---
-with tab_compras:
-    st.subheader("Módulo de Compras")
-    u_compras = st.file_uploader("Subir Compras", type=["pdf","jpg","png"], accept_multiple_files=True, key="c")
-    if st.button("Procesar Compras") and u_compras:
-        res_ok, errores = [], []
-        bar = st.progress(0)
-        for idx, f in enumerate(u_compras):
-            res, err = procesar_archivo(f, f"Foco en PROVEEDOR. {extra_field}")
-            if err:
-                st.error(f"Error en {f.name}: Contacte a su Tatito.")
-                errores.append({"archivo": f.name, "error": err})
-            else:
-                res_ok.append(res)
-            bar.progress((idx + 1) / len(u_compras))
+        for i, img in enumerate(paginas):
+            prompt = f"""
+            Eres un experto contable argentino. Analiza la imagen y extrae TODOS los comprobantes que veas.
+            Si hay más de uno, devuelve una lista de objetos JSON.
             
-        if res_ok:
-            df = pd.DataFrame(res_ok)
+            Campos requeridos por cada comprobante:
+            - TIPO_FACTURA: (A, B, C, M, Ticket, etc)
+            - PUNTO_VENTA: Solo los 4 o 5 dígitos antes del guión.
+            - NRO_FACTURA: Solo los 8 dígitos después del guión.
+            - CUIT_EMISOR: Con guiones.
+            - FECHA_EMISION: DD/MM/AAAA.
+            - RAZON_SOCIAL: Nombre del emisor.
+            - MONTO_GRAVADO: Neto sin impuestos.
+            - IVA_21: Monto del IVA al 21%.
+            - MONTO_NO_GRAVADO: Si hay conceptos que no sabes dónde ubicar o son 'No Gravados', ponlos aquí.
+            - MONTO_TOTAL: Total final.
+
+            {instruccion_extra}
+
+            IMPORTANTE: Devuelve unicamente una lista de JSON: [{{...}}, {{...}}].
+            Si no encuentras nada, devuelve [].
+            """
+
+            response = client.models.generate_content(model=MODEL_ID, contents=[prompt, img])
+            
+            # Limpiar y parsear (la IA puede devolver un objeto o una lista)
+            texto = response.text.replace("```json", "").replace("```", "").strip()
+            data = json.loads(texto)
+            
+            if isinstance(data, dict): data = [data] # Normalizar a lista
+            
+            for item in data:
+                item = aplicar_logica_contable(item)
+                item["HOJA"] = i + 1
+                item["ARCHIVO"] = file.name
+                resultados_archivo.append(item)
+                
+        return resultados_archivo, None
+    except Exception as e:
+        return [], str(e)
+
+# --- INTERFAZ ---
+st.set_page_config(page_title="TatoBot Pro", layout="wide")
+st.title("🚀 Extractor Contable Multipage v3.0")
+
+tab_comp, tab_vent = st.tabs(["🛒 Compras", "💰 Ventas"])
+
+def render_modulo(key, label):
+    st.subheader(f"Procesar {label}")
+    u_files = st.file_uploader(f"Subir {label}", type=["pdf","jpg","png"], accept_multiple_files=True, key=key)
+    if st.button(f"Ejecutar {label}") and u_files:
+        final_data = []
+        bar = st.progress(0)
+        for idx, f in enumerate(u_files):
+            # Instrucción específica para separar PV y NRO
+            extra = "SEPARA estrictamente PUNTO_VENTA (4-5 nros) de NRO_FACTURA (8 nros). No los mezcles."
+            res, err = procesar_archivo(f, extra)
+            if err: st.error(f"Error en {f.name}: {err}")
+            else: final_data.extend(res)
+            bar.progress((idx + 1) / len(u_files))
+        
+        if final_data:
+            df = pd.DataFrame(final_data)
             st.dataframe(df)
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine='xlsxwriter') as w:
                 df.to_excel(w, index=False)
-            st.download_button("📥 Descargar Excel Compras", buf.getvalue(), "compras.xlsx")
-        if errores:
-            with st.expander("🛠️ Detalle Técnico"):
-                st.write(errores)
+            st.download_button(f"📥 Descargar Excel {label}", buf.getvalue(), f"{label.lower()}.xlsx")
 
-# --- LÓGICA DE VENTAS ---
-with tab_ventas:
-    st.subheader("Módulo de Ventas")
-    u_ventas = st.file_uploader("Subir Ventas", type=["pdf","jpg","png"], accept_multiple_files=True, key="v")
-    if st.button("Procesar Ventas") and u_ventas:
-        res_ok_v, errores_v = [], []
-        bar_v = st.progress(0)
-        for idx, f in enumerate(u_ventas):
-            res, err = procesar_archivo(f, f"Foco en CLIENTE / RECEPTOR. {extra_field}")
-            if err:
-                st.error(f"Error en {f.name}: Contacte a su Tatito.")
-                errores_v.append({"archivo": f.name, "error": err})
-            else:
-                res_ok_v.append(res)
-            bar_v.progress((idx + 1) / len(u_ventas))
-            
-        if res_ok_v:
-            df_v = pd.DataFrame(res_ok_v)
-            st.dataframe(df_v)
-            buf_v = io.BytesIO()
-            with pd.ExcelWriter(buf_v, engine='xlsxwriter') as w:
-                df_v.to_excel(w, index=False)
-            st.download_button("📥 Descargar Excel Ventas", buf_v.getvalue(), "ventas.xlsx")
-        if errores_v:
-            with st.expander("🛠️ Detalle Técnico"):
-                st.write(errores_v)
+with tab_comp: render_modulo("c", "Compras")
+with tab_vent: render_modulo("v", "Ventas")
