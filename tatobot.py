@@ -7,143 +7,170 @@ import io
 import json
 import re
 
-# --- CONFIGURACIÓN ---
+# --- 1. CONFIGURACIÓN DE TU POOL DE MODELOS ---
+# Usamos esta lista en orden. Si uno falla por límite, salta al siguiente.
+MODEL_POOL = [
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-3-flash-preview"
+]
+
 try:
-    API_KEY = st.secrets["GOOGLE_API_KEY"]
+    API_KEY = st.secrets["GOOGLE_API_KEY"] #Pensaste que te iba a mostrar la API KEY? rajá de acá tontito.
     client = genai.Client(api_key=API_KEY)
-    MODEL_ID = "gemini-2.5-flash-lite" 
 except Exception as e:
-    st.error("⚠️ Error de configuración.")
+    st.error("⚠️ Error: Configure su API KEY en los Secrets de Streamlit.")
     st.stop()
 
-def limpiar_monto_argentino(valor):
-    """
-    Convierte montos tipo '3.914,96' a float 3914.96 de forma segura.
-    """
-    if valor is None or str(valor).lower() == "null" or valor == "":
-        return 0.0
-    
-    s = str(valor).strip().replace('$', '').replace(' ', '')
-    
-    # Si tiene punto y coma (ej: 1.234,56)
-    if '.' in s and ',' in s:
-        s = s.replace('.', '').replace(',', '.')
-    # Si solo tiene coma (ej: 1234,56)
-    elif ',' in s:
-        s = s.replace(',', '.')
-    # Si tiene un punto que parece de miles (ej: 1.234) pero no hay decimales
-    # Esto es arriesgado, pero en facturas el punto suele ser mil.
-    
+# --- 2. FUNCIONES DE LIMPIEZA ---
+def limpiar_monto_maquina(valor):
+    """Convierte el string '1234.56' de la IA a float directamente."""
+    if not valor or str(valor).lower() == "null": return 0.0
     try:
-        # Extraer solo el número con su decimal
-        res = re.findall(r"[-+]?\d*\.\d+|\d+", s)
-        return float(res[0]) if res else 0.0
-    except:
-        return 0.0
+        # Quitamos todo lo que no sea número o punto
+        s = re.sub(r'[^\d.]', '', str(valor))
+        return float(s)
+    except: return 0.0
 
-def procesar_archivo(file, instruccion_extra):
-    resultados_archivo = []
-    try:
-        if file.type == "application/pdf":
-            # Reducimos la resolución (DPI) para ganar velocidad sin perder mucha calidad
-            paginas = convert_from_bytes(file.read(), dpi=150)
-        else:
-            paginas = [Image.open(file)]
+def llamar_ia_con_rotacion(prompt, imagen):
+    """Intenta procesar con los modelos disponibles para maximizar consultas gratis."""
+    for model_id in MODEL_POOL:
+        try:
+            response = client.models.generate_content(model=model_id, contents=[prompt, imagen])
+            return response.text, model_id
+        except Exception as e:
+            msg = str(e).lower()
+            if "429" in msg or "quota" in msg:
+                continue # Salto al siguiente modelo si este se agotó
+            else:
+                return None, f"Error técnico: {e}"
+    return None, "Se agotaron todos los modelos del pool por hoy."
 
-        for i, img in enumerate(paginas):
-            # Usamos un mensaje de estado para el usuario
-            with st.status(f"Analizando {file.name} - Página {i+1}...", expanded=False) as status:
-                prompt = f"""
-                Eres un extractor de datos contables preciso. 
-                Analiza la imagen y busca TODOS los comprobantes.
-                
-                Reglas de Oro:
-                1. PUNTO_VENTA: Los dígitos antes del guión (ej: de 02019-00048381, extrae '02019').
-                2. NRO_FACTURA: Los 8 dígitos después del guión.
-                3. Extrae los montos tal cual aparecen (con comas o puntos).
-                
-                Campos a extraer:
-                TIPO_FACTURA, PUNTO_VENTA, NRO_FACTURA, CUIT_EMISOR, FECHA_EMISION, 
-                RAZON_SOCIAL, MONTO_GRAVADO, IVA_21, IVA_10_5, PERCEPCION_IVA, MONTO_TOTAL.
+# --- 3. LÓGICA DE EXTRACCIÓN ---
+def procesar_comprobante(file):
+    resultados_totales = []
+    
+    # Conversión de PDF o Imagen
+    if file.type == "application/pdf":
+        paginas = convert_from_bytes(file.read(), dpi=150)
+    else:
+        paginas = [Image.open(file)]
 
-                {instruccion_extra}
+    for i, img in enumerate(paginas):
+        with st.status(f"Procesando {file.name} - Pág {i+1}...") as status:
+            prompt = """
+            Actúa como un auditor contable de Argentina. 
+            Busca el bloque de TOTALES al final de la factura.
+            
+            REGLAS ESTRICTAS:
+            1. UN COMPROBANTE = UNA FILA. Ignora el detalle de productos/servicios.
+            2. DECIMALES: Devuelve los números SIEMPRE en formato '1234.56' (usa punto para decimales).
+            3. FECHA: Usa 'Fecha de emisión' o 'Fecha'. IGNORA 'Inicio de actividades'.
+            4. TIPO: Solo 'A', 'B' o 'C'. Si el IVA está discriminado, es 'A'.
+            5. CUIT: Extrae el CUIT del EMISOR (el que vende).
 
-                Devuelve UNA LISTA de JSON: [{{...}}, {{...}}]
-                Si la respuesta es muy larga, simplifica la RAZON_SOCIAL.
-                """
+            Devuelve una lista de JSON con este formato:
+            [{
+                "TIPO_FACTURA": "",
+                "PUNTO_VENTA": "solo números antes del guión",
+                "NRO_FACTURA": "8 números después del guión",
+                "CUIT_EMISOR": "",
+                "FECHA_EMISION": "DD/MM/AAAA",
+                "RAZON_SOCIAL": "",
+                "MONTO_GRAVADO": "número.punto",
+                "IVA_21": "número.punto",
+                "IVA_10_5": "número.punto",
+                "PERCEPCION_IVA": "número.punto",
+                "MONTO_TOTAL": "número.punto"
+            }]
+            """
 
-                response = client.models.generate_content(model=MODEL_ID, contents=[prompt, img])
-                
+            texto, model_info = llamar_ia_con_rotacion(prompt, img)
+            
+            if texto:
                 try:
-                    texto = response.text.replace("```json", "").replace("```", "").strip()
-                    data = json.loads(texto)
+                    limpio = texto.replace("```json", "").replace("```", "").strip()
+                    data = json.loads(limpio)
                     if isinstance(data, dict): data = [data]
-                    
-                    for item in data:
-                        # --- LIMPIEZA Y LÓGICA MATEMÁTICA ---
-                        g = limpiar_monto_argentino(item.get("MONTO_GRAVADO"))
-                        i21 = limpiar_monto_argentino(item.get("IVA_21"))
-                        i105 = limpiar_monto_argentino(item.get("IVA_10_5"))
-                        per = limpiar_monto_argentino(item.get("PERCEPCION_IVA"))
-                        total = limpiar_monto_argentino(item.get("MONTO_TOTAL"))
+
+                    for c in data:
+                        # Limpieza y cálculos 
+                        total = limpiar_monto_maquina(c.get("MONTO_TOTAL"))
+                        g = limpiar_monto_maquina(c.get("MONTO_GRAVADO"))
+                        i21 = limpiar_monto_maquina(c.get("IVA_21"))
+                        i105 = limpiar_monto_maquina(c.get("IVA_10_5"))
+                        per = limpiar_monto_maquina(c.get("PERCEPCION_IVA"))
                         
-                        # Calculamos el No Gravado por diferencia (Fórmula solicitada)
-                        # No Gravado = Total - (Gravado + IVA21 + IVA105 + Percepcion)
-                        no_gravado = round(total - (g + i21 + i105 + per), 2)
+                        tipo = str(c.get("TIPO_FACTURA", "")).upper()
+                        if "B" in tipo:
+                            tipo = "B"
+                            g = round(total / 1.21, 2)
+                            i21 = round(total - g, 2)
+                            i105, per = 0.0, 0.0
+                        elif "A" in tipo: tipo = "A"
+
+                        # Fórmula para capturar conceptos raros (Combustibles, Tasas, etc)
+                        no_grav = round(total - (g + i21 + i105 + per), 2)
                         
-                        # Guardamos los valores finales limpios
-                        item["MONTO_GRAVADO"] = g
-                        item["IVA_21"] = i21
-                        item["IVA_10_5"] = i105
-                        item["PERCEPCION_IVA"] = per
-                        item["MONTO_NO_GRAVADO"] = no_gravado if no_gravado > 0.01 else 0.0
-                        item["MONTO_TOTAL"] = total
-                        
-                        item["ARCHIVO"] = file.name
-                        item["PAG"] = i + 1
-                        resultados_archivo.append(item)
-                    
-                    status.update(label=f"Página {i+1} completada", state="complete")
-                except Exception as e:
-                    st.error(f"Error parseando JSON en pág {i+1}: {e}")
-                    continue
+                        c.update({
+                            "TIPO_FACTURA": tipo,
+                            "MONTO_GRAVADO": g, "IVA_21": i21, "IVA_10_5": i105,
+                            "PERCEPCION_IVA": per, "MONTO_TOTAL": total,
+                            "MONTO_NO_GRAVADO": no_grav if no_grav > 0.05 else 0.0,
+                            "ARCHIVO": file.name, "HOJA": i+1, "MODELO": model_info
+                        })
+                        resultados_totales.append(c)
+                    status.update(label="Analizado", state="complete")
+                except:
+                    status.update(label="Error en formato de datos", state="error")
+            else:
+                st.warning(f"Aviso en {file.name}: {model_info}")
                 
-        return resultados_archivo, None
-    except Exception as e:
-        return [], str(e)
+    return resultados_totales
 
-# --- INTERFAZ ---
-st.set_page_config(page_title="TatoBot v4", layout="wide")
-st.title("📊 TatoBot AI: Extractor Contable Premium")
+# --- 4. INTERFAZ DE USUARIO ---
+st.set_page_config(page_title="TatoBot, el bot de los capos", layout="wide")
+st.title("📊 TatoBot Pro: Extracción de documentos")
 
-u_files = st.file_uploader("Subir Compras/Ventas", type=["pdf","jpg","png"], accept_multiple_files=True)
+with st.sidebar:
+    st.header("⚙️ Estado del Sistema")
+    st.success(f"Pool Activo: {len(MODEL_POOL)} modelos")
+    st.write("Prioridad actual:", MODEL_POOL[0])
 
-if st.button("🚀 Ejecutar Procesamiento Masivo") and u_files:
-    all_results = []
-    main_bar = st.progress(0)
+archivos = st.file_uploader("Subir Facturas de Compras o Ventas", type=["pdf","jpg","png"], accept_multiple_files=True)
+
+if st.button("🚀 Procesar Todo") and archivos:
+    lista_final = []
+    progreso = st.progress(0)
     
-    # Contenedor para ver el progreso
-    for idx, f in enumerate(u_files):
-        res, err = procesar_archivo(f, "Extrae montos con sus decimales originales.")
-        if err:
-            st.error(f"Error crítico en {f.name}: {err}")
-        else:
-            all_results.extend(res)
-        
-        main_bar.progress((idx + 1) / len(u_files))
+    for idx, f in enumerate(archivos):
+        res = procesar_comprobante(f)
+        lista_final.extend(res)
+        progreso.progress((idx + 1) / len(archivos))
     
-    if all_results:
-        df = pd.DataFrame(all_results)
-        st.success(f"✅ Procesados {len(all_results)} comprobantes con éxito.")
+    if lista_final:
+        df = pd.DataFrame(lista_final)
         
-        # Reordenar columnas para que sea cómodo
-        cols = ["ARCHIVO", "PAG", "FECHA_EMISION", "RAZON_SOCIAL", "TIPO_FACTURA", "PUNTO_VENTA", "NRO_FACTURA", 
-                "MONTO_GRAVADO", "IVA_21", "IVA_10_5", "PERCEPCION_IVA", "MONTO_NO_GRAVADO", "MONTO_TOTAL"]
-        df = df[cols]
+        # Reordenar columnas para que el CUIT esté visible al principio
+        cols = ["ARCHIVO", "HOJA", "FECHA_EMISION", "RAZON_SOCIAL", "CUIT_EMISOR", "TIPO_FACTURA", 
+                "PUNTO_VENTA", "NRO_FACTURA", "MONTO_GRAVADO", "IVA_21", "IVA_10_5", 
+                "PERCEPCION_IVA", "MONTO_NO_GRAVADO", "MONTO_TOTAL", "MODELO"]
         
+        # Filtramos por si alguna columna no se generó
+        df = df[[c for c in cols if c in df.columns]]
+        
+        st.subheader("📋 Vista Previa de los Datos")
         st.dataframe(df)
         
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine='xlsxwriter') as w:
-            df.to_excel(w, index=False)
-        st.download_button("📥 Descargar Excel Final", buf.getvalue(), "extraccion_tatobot.xlsx")
+        # Exportar a Excel
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False)
+        
+        st.download_button(
+            label="📥 Descargar Excel para Contabilidad",
+            data=output.getvalue(),
+            file_name="extraccion_tatobot.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
